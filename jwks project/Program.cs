@@ -76,16 +76,18 @@ public static class KeyManager
     public static void CreateAndStoreKey(bool expired)
     {
         using var rsa = RSA.Create(2048);
-        var key = new RsaSecurityKey(rsa);
         var expiry = DateTimeOffset.UtcNow.AddHours(expired ? -1 : 1).ToUnixTimeSeconds();
         var pemKey = ExportKeyToPEM(rsa);
 
         using var connection = new SQLiteConnection(ConnectionString);
         connection.Open();
         var command = connection.CreateCommand();
-        command.CommandText = "INSERT INTO keys (key, exp) VALUES (@key, @exp)";
-        command.Parameters.AddWithValue("@key", Encoding.UTF8.GetBytes(pemKey));
-        command.Parameters.AddWithValue("@exp", expiry);
+        command.CommandText = "INSERT INTO keys (key, exp) VALUES (?, ?)";
+
+        // Explicitly adding parameters using `?` placeholders
+        command.Parameters.Add(new SQLiteParameter { Value = Encoding.UTF8.GetBytes(pemKey) });
+        command.Parameters.Add(new SQLiteParameter { Value = expiry });
+
         command.ExecuteNonQuery();
     }
 
@@ -93,14 +95,16 @@ public static class KeyManager
     {
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var query = expired
-            ? "SELECT kid, key FROM keys WHERE exp <= @now ORDER BY exp DESC LIMIT 1"
-            : "SELECT kid, key FROM keys WHERE exp > @now ORDER BY exp ASC LIMIT 1";
+            ? "SELECT kid, key FROM keys WHERE exp <= ? ORDER BY exp DESC LIMIT 1"
+            : "SELECT kid, key FROM keys WHERE exp > ? ORDER BY exp ASC LIMIT 1";
 
         using var connection = new SQLiteConnection(ConnectionString);
         connection.Open();
         var command = connection.CreateCommand();
         command.CommandText = query;
-        command.Parameters.AddWithValue("@now", now);
+
+        // Adding the parameter with positional placeholder `?`
+        command.Parameters.Add(new SQLiteParameter { Value = now });
 
         using var reader = command.ExecuteReader();
         if (reader.Read())
@@ -123,8 +127,10 @@ public static class KeyManager
         connection.Open();
 
         var command = connection.CreateCommand();
-        command.CommandText = "SELECT kid, key FROM keys WHERE exp > @now";
-        command.Parameters.AddWithValue("@now", now);
+        command.CommandText = "SELECT kid, key FROM keys WHERE exp > ?";
+
+        // Adding the parameter with positional placeholder `?`
+        command.Parameters.Add(new SQLiteParameter { Value = now });
 
         using var reader = command.ExecuteReader();
         var keys = new List<(RsaSecurityKey, int)>();
