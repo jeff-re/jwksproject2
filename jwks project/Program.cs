@@ -6,26 +6,21 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.IdentityModel.Tokens;
 using System;
 using System.Collections.Generic;
+using System.Data.SQLite;
 using System.IdentityModel.Tokens.Jwt;
 using System.Linq;
 using System.Security.Claims;
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 
 public class Program
 {
     public static void Main(string[] args)
     {
-        // Generate initial key
-        KeyManager.CreateKey();
-
-        // Add an expired key for testing purposes
-        var rsa = RSA.Create(2048);
-        var expiredKey = new RsaSecurityKey(rsa);
-        var expiredKid = Guid.NewGuid().ToString();
-        expiredKey.KeyId = expiredKid;  // Set KeyId on the key itself
-        var expiredDate = DateTime.UtcNow.AddMinutes(-10);
-        KeyManager.keys[expiredKid] = (expiredKey, expiredDate);
+        KeyManager.InitializeDatabase();
+        KeyManager.CreateAndStoreKey(expired: true); // Create an expired key for testing
+        KeyManager.CreateAndStoreKey(expired: false); // Create a valid key for testing
 
         CreateHostBuilder(args).Build().Run();
     }
@@ -61,71 +56,116 @@ public class Startup
     }
 }
 
-public class KeyManager
+public static class KeyManager
 {
-    public static Dictionary<string, (RsaSecurityKey key, DateTime expiry)> keys = new Dictionary<string, (RsaSecurityKey, DateTime)>();
-    private static TimeSpan expiryPeriod = TimeSpan.FromHours(1);
+    private static readonly string ConnectionString = "Data Source=totally_not_my_privateKeys.db;";
 
-    public static (RsaSecurityKey key, string kid) CreateKey()
+    public static void InitializeDatabase()
     {
-        var rsa = RSA.Create(2048);  // Create a new RSA key with 2048 bits
+        using var connection = new SQLiteConnection(ConnectionString);
+        connection.Open();
+
+        var command = connection.CreateCommand();
+        command.CommandText = @"CREATE TABLE IF NOT EXISTS keys(
+                                    kid INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    key BLOB NOT NULL,
+                                    exp INTEGER NOT NULL)";
+        command.ExecuteNonQuery();
+    }
+
+    public static void CreateAndStoreKey(bool expired)
+    {
+        using var rsa = RSA.Create(2048);
         var key = new RsaSecurityKey(rsa);
-        var kid = Guid.NewGuid().ToString();  // Generate a unique kid (key ID)
-        key.KeyId = kid;  // Set KeyId on the key itself
-        var expiry = DateTime.UtcNow.Add(expiryPeriod);
+        var expiry = DateTimeOffset.UtcNow.AddHours(expired ? -1 : 1).ToUnixTimeSeconds();
+        var pemKey = ExportKeyToPEM(rsa);
 
-        keys[kid] = (key, expiry);
-
-        return (key, kid);
+        using var connection = new SQLiteConnection(ConnectionString);
+        connection.Open();
+        var command = connection.CreateCommand();
+        command.CommandText = "INSERT INTO keys (key, exp) VALUES (@key, @exp)";
+        command.Parameters.AddWithValue("@key", Encoding.UTF8.GetBytes(pemKey));
+        command.Parameters.AddWithValue("@exp", expiry);
+        command.ExecuteNonQuery();
     }
 
-    public static IEnumerable<(RsaSecurityKey key, string kid)> GetUnexpiredKeys()
+    public static (RsaSecurityKey key, int kid)? GetKey(bool expired)
     {
-        var now = DateTime.UtcNow;
-        return keys.Where(k => k.Value.expiry > now).Select(k => (k.Value.key, k.Key));
-    }
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var query = expired
+            ? "SELECT kid, key FROM keys WHERE exp <= @now ORDER BY exp DESC LIMIT 1"
+            : "SELECT kid, key FROM keys WHERE exp > @now ORDER BY exp ASC LIMIT 1";
 
-    public static (RsaSecurityKey key, string kid)? GetKeyByExpiry(bool expired)
-    {
-        var now = DateTime.UtcNow;
-        var key = expired
-            ? keys.FirstOrDefault(k => k.Value.expiry < now)
-            : keys.FirstOrDefault(k => k.Value.expiry > now);
+        using var connection = new SQLiteConnection(ConnectionString);
+        connection.Open();
+        var command = connection.CreateCommand();
+        command.CommandText = query;
+        command.Parameters.AddWithValue("@now", now);
 
-        if (key.Equals(default(KeyValuePair<string, (RsaSecurityKey, DateTime)>)))
+        using var reader = command.ExecuteReader();
+        if (reader.Read())
         {
-            return null;
+            var kid = reader.GetInt32(0);
+            var pemKey = Encoding.UTF8.GetString((byte[])reader["key"]);
+            var rsa = ImportKeyFromPEM(pemKey);
+            var rsaSecurityKey = new RsaSecurityKey(rsa) { KeyId = kid.ToString() };
+
+            return (rsaSecurityKey, kid);
         }
 
-        return (key.Value.key, key.Key);
+        return null;
+    }
+
+    public static IEnumerable<(RsaSecurityKey key, int kid)> GetUnexpiredKeys()
+    {
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        using var connection = new SQLiteConnection(ConnectionString);
+        connection.Open();
+
+        var command = connection.CreateCommand();
+        command.CommandText = "SELECT kid, key FROM keys WHERE exp > @now";
+        command.Parameters.AddWithValue("@now", now);
+
+        using var reader = command.ExecuteReader();
+        var keys = new List<(RsaSecurityKey, int)>();
+
+        while (reader.Read())
+        {
+            var kid = reader.GetInt32(0);
+            var pemKey = Encoding.UTF8.GetString((byte[])reader["key"]);
+            var rsa = ImportKeyFromPEM(pemKey);
+            keys.Add((new RsaSecurityKey(rsa) { KeyId = kid.ToString() }, kid));
+        }
+
+        return keys;
+    }
+
+    private static string ExportKeyToPEM(RSA rsa)
+    {
+        var key = rsa.ExportRSAPrivateKey();
+        return Convert.ToBase64String(key);
+    }
+
+    private static RSA ImportKeyFromPEM(string pem)
+    {
+        var rsa = RSA.Create();
+        rsa.ImportRSAPrivateKey(Convert.FromBase64String(pem), out _);
+        return rsa;
     }
 
     public static string GetJWKS()
     {
         var unexpiredKeys = GetUnexpiredKeys();
-        var jwks = new List<JsonWebKey>();
-
-        foreach (var (key, kid) in unexpiredKeys)
+        var jwks = unexpiredKeys.Select(k => new JsonWebKey
         {
-            var rsaParameters = key.Rsa?.ExportParameters(false) ?? key.Parameters;
+            Kid = k.kid.ToString(),
+            Kty = "RSA",
+            Use = "sig",
+            Alg = SecurityAlgorithms.RsaSha256,
+            N = Base64UrlEncoder.Encode(k.key.Rsa.ExportParameters(false).Modulus),
+            E = Base64UrlEncoder.Encode(k.key.Rsa.ExportParameters(false).Exponent)
+        });
 
-            if (rsaParameters.Modulus == null || rsaParameters.Exponent == null)
-            {
-                throw new Exception("RSA key parameters are missing.");
-            }
-
-            jwks.Add(new JsonWebKey
-            {
-                Kid = kid,
-                Kty = "RSA",
-                Use = "sig",
-                Alg = SecurityAlgorithms.RsaSha256,
-                N = Base64UrlEncoder.Encode(rsaParameters.Modulus),
-                E = Base64UrlEncoder.Encode(rsaParameters.Exponent)
-            });
-        }
-
-        // Serialize the keys as a JWKS JSON object
         return JsonSerializer.Serialize(new { keys = jwks });
     }
 }
@@ -137,7 +177,7 @@ public class AuthController : ControllerBase
     [HttpPost]
     public IActionResult Authenticate([FromQuery] bool expired = false)
     {
-        var keyData = KeyManager.GetKeyByExpiry(expired);
+        var keyData = KeyManager.GetKey(expired);
         if (keyData == null)
         {
             return BadRequest($"No {(expired ? "expired" : "unexpired")} keys available");
@@ -146,13 +186,12 @@ public class AuthController : ControllerBase
         var (key, kid) = keyData.Value;
         var now = DateTime.UtcNow;
 
-        // Set token expiry and notBefore depending on whether expired tokens are requested
         var expiry = expired ? now.AddMinutes(-30) : now.AddMinutes(30);
         var notBefore = expired ? now.AddMinutes(-60) : now;
 
         var tokenDescriptor = new SecurityTokenDescriptor
         {
-            Subject = new ClaimsIdentity(new Claim[]
+            Subject = new ClaimsIdentity(new[]
             {
                 new Claim(JwtRegisteredClaimNames.Sub, "user_id"),
                 new Claim(JwtRegisteredClaimNames.Iat, ((DateTimeOffset)now).ToUnixTimeSeconds().ToString(), ClaimValueTypes.Integer64),
